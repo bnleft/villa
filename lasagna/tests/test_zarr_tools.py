@@ -149,6 +149,93 @@ def test_convert_fit_builds_channel_pyramids(tmp_path):
     assert open_group(tmp_path / "out_nx.ome.zarr").attrs["lasagna_pyramid_downsample"] == "normal_second_moment_mean_pool2x"
 
 
+def test_convert_manifest_v2_3d_and_v3_compact_selective_and_sparse(tmp_path):
+    from lasagna.lasagna_volume import ChannelGroup, LasagnaVolume
+
+    # 1. Legacy v2 .lasagna.json with 3D single-channel Zarrs (sparse inside a larger base_shape)
+    v2_dir = tmp_path / "v2"
+    v2_dir.mkdir()
+    cos_src = np.zeros((16, 16, 16), dtype=np.uint8)
+    nx_src = np.zeros((16, 16, 16), dtype=np.uint8)
+    ny_src = np.zeros((16, 16, 16), dtype=np.uint8)
+    cos_src[:8, :8, :8] = _volume((8, 8, 8), seed=10)
+    nx_src[:8, :8, :8] = _volume((8, 8, 8), seed=11)
+    ny_src[:8, :8, :8] = _volume((8, 8, 8), seed=12)
+    for name, arr in (("cos", cos_src), ("nx", nx_src), ("ny", ny_src)):
+        zw = ZarrWriter.create(v2_dir / f"{name}.zarr" / "1", shape=arr.shape, chunks=(8, 8, 8), dtype=np.uint8, skip_empty=True)
+        zw[:8, :8, :8] = arr[:8, :8, :8]
+
+    v2_manifest = v2_dir / "sample.lasagna.json"
+    vol_v2 = LasagnaVolume(
+        path=v2_manifest,
+        base_shape_zyx=(32, 32, 32),
+        groups={
+            "cos": ChannelGroup("cos.zarr/1", 1, ["cos"]),
+            "nx": ChannelGroup("nx.zarr/1", 1, ["nx"]),
+            "ny": ChannelGroup("ny.zarr/1", 1, ["ny"]),
+        },
+    )
+    vol_v2.save()
+
+    written_v2 = convert.run_from_manifest(
+        manifest_path=str(v2_manifest),
+        output_prefix=str(tmp_path / "v2_out"),
+        levels=3,
+        chunk=8,
+        workers=2,
+        channels=["cos", "nx", "ny"],
+    )
+    assert set(written_v2) == {"cos", "nx", "ny"}
+    assert (tmp_path / "v2_out_cos.ome.zarr").is_dir()
+    assert not (tmp_path / "v2_out_cos_cos.ome.zarr").exists()
+    # Sparse upsampling only populates chunks covering the non-empty octant
+    assert set(ZarrWriter.open(tmp_path / "v2_out_cos.ome.zarr" / "0").stored_chunks()) == {
+        (iz, iy, ix) for iz in (0, 1) for iy in (0, 1) for ix in (0, 1)
+    }
+    np.testing.assert_array_equal(
+        open_zarr(tmp_path / "v2_out_cos.ome.zarr" / "0")[...],
+        cos_src.repeat(2, 0).repeat(2, 1).repeat(2, 2),
+    )
+    # Paired normal pyramid built across separate 3D manifest groups
+    nx_down, ny_down = _moment_pool2x_normals(nx_src, ny_src)
+    np.testing.assert_array_equal(open_zarr(tmp_path / "v2_out_nx.ome.zarr" / "2")[...], nx_down)
+    np.testing.assert_array_equal(open_zarr(tmp_path / "v2_out_ny.ome.zarr" / "2")[...], ny_down)
+    assert open_group(tmp_path / "v2_out_nx.ome.zarr").attrs["lasagna_pyramid_downsample"] == "normal_second_moment_mean_pool2x"
+    # Input source Zarr attrs were not mutated on disk
+    assert "preprocess_params" not in open_zarr(v2_dir / "cos.zarr" / "1").attrs
+
+    # 2. Compact v3 .zarr manifest with multi-channel CZYX store: converts ONLY requested channels
+    v3_root = tmp_path / "compact_pred.zarr"
+    create_group(v3_root)
+    sd1_group = create_group(v3_root / "sd1")
+    packed = np.stack([_volume((8, 8, 8), seed=20 + i) for i in range(3)])
+    sd1_arr = sd1_group.create_array("1", shape=packed.shape, chunks=(3, 8, 8, 8), dtype=np.uint8)
+    sd1_arr[:] = packed
+    vol_v3 = LasagnaVolume(
+        path=v3_root,
+        version=3,
+        base_shape_zyx=(16, 16, 16),
+        validity_channel="chunks",
+        groups={"sd1": ChannelGroup("sd1/1", 1, ["cos", "pred_dt", "grad_mag"])},
+    )
+    vol_v3.save()
+
+    assert convert.main([
+        "--manifest", str(v3_root),
+        "--output-prefix", str(tmp_path / "v3_out"),
+        "--levels", "3",
+        "--chunk", "8",
+        "--workers", "2",
+    ]) == 0
+    # Default channels convert cos + pred_dt only, without double suffix or unwanted grad_mag
+    assert (tmp_path / "v3_out_cos.ome.zarr").is_dir()
+    assert (tmp_path / "v3_out_pred_dt.ome.zarr").is_dir()
+    assert not (tmp_path / "v3_out_grad_mag.ome.zarr").exists()
+    assert not (tmp_path / "v3_out_cos_cos.ome.zarr").exists()
+    np.testing.assert_array_equal(open_zarr(tmp_path / "v3_out_cos.ome.zarr" / "1")[...], packed[0])
+    np.testing.assert_array_equal(open_zarr(tmp_path / "v3_out_pred_dt.ome.zarr" / "1")[...], packed[1])
+
+
 def test_holescan_lists_only_stored_chunks_of_the_channel(tmp_path):
     array = ZarrWriter.create(tmp_path / "v.zarr", shape=(2, 8, 8, 8), chunks=(1, 4, 4, 4), dtype=np.uint8)
     array[0, 0:4, 0:4, 4:8] = 1
